@@ -87,7 +87,17 @@ function buildFallbackTool(targetFormat?: string | null): JsonRecord {
   };
 }
 
+// #TOG-2391: same provider guard as webSearchFallback.ts's
+// CLAUDE_FORMAT_PROVIDERS_WITHOUT_SERVER_TOOLS/CLIPROXY_PROVIDER_RE. CLIProxyAPI's
+// Claude-executor emulation does not reliably forward a caller's declared tool
+// manifest end to end (live repro on web_search, web_fetch, bash, code_execution
+// alike — see the comment there), so default to the safe fallback for this provider
+// even with no interceptFetch DB row configured, overriding Hard Rule #20's
+// otherwise-correct "opt-in, never default-on" precedent for every other provider.
+const CLIPROXY_PROVIDER_RE = /^(cliproxy|openai-compatible-cliproxy)(-[0-9a-f-]{36})?$/i;
+
 export function supportsNativeWebFetchFallbackBypass({
+  provider,
   interceptFetchOverride,
 }: {
   provider?: string | null;
@@ -105,7 +115,11 @@ export function supportsNativeWebFetchFallbackBypass({
   // default-on" precedent and the zero-overhead-when-disabled requirement.
   interceptFetchOverride?: boolean;
 }): boolean {
-  return interceptFetchOverride !== true;
+  if (typeof interceptFetchOverride === "boolean") {
+    return !interceptFetchOverride;
+  }
+  if (provider && CLIPROXY_PROVIDER_RE.test(provider)) return false;
+  return true;
 }
 
 export function prepareWebFetchFallbackBody<T extends WebFetchFallbackBody>(

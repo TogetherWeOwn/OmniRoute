@@ -136,13 +136,41 @@ function buildFallbackTool(tool: JsonRecord, targetFormat?: string | null): Json
   };
 }
 
-// Providers whose endpoint advertises Claude/Anthropic format but does NOT implement
-// Anthropic's typed server tools (web_search_20250305, …). For these the Claude -> Claude
-// bypass below must NOT apply: forwarding the native server tool makes the upstream 400
-// (MiniMax returns `invalid params, function name or parameters is empty (2013)`), so the
-// built-in web-search tool has to be converted to the omniroute_web_search function
-// fallback — which these models accept as a normal function tool (#4481).
+// Providers whose endpoint advertises Claude/Anthropic format but do NOT reliably forward
+// Anthropic's typed server tools (web_search_20250305, …) end to end. For these the
+// Claude -> Claude bypass below must NOT apply: forwarding the native server tool either
+// 400s upstream (MiniMax: `invalid params, function name or parameters is empty (2013)`,
+// #4481) or is silently dropped in transit, so the built-in web-search tool has to be
+// converted to the omniroute_web_search function fallback — which these models accept as
+// a normal function tool.
+//
+// `cliproxy` added for #TOG-2391: CLIProxyAPI's Claude-executor emulation does not
+// preserve the caller's declared tool manifest end to end (live repro: a forced
+// `tool_choice` on any declared Anthropic server tool — web_search, web_fetch, bash,
+// code_execution — 400s with the genuine Anthropic error `Tool '<name>' not found in
+// provided tools`; a bogus custom tool name round-tripped as a DIFFERENT session's real
+// tool identity, confirming the manifest reaching the model is not the one this request
+// declared). Bypassing native passthrough for this provider is safer than trusting it to
+// forward server tools correctly. Equivalent immediate mitigation without a code deploy:
+// set `interceptSearch: true` for provider "cliproxy" in the `interception_rules`
+// key_value table (src/lib/db/interceptionRules.ts) — this code-level default is the
+// durable safety net in case that operator config is ever absent, reset, or the provider
+// alias changes.
 const CLAUDE_FORMAT_PROVIDERS_WITHOUT_SERVER_TOOLS = new Set(["minimax"]);
+
+// #TOG-2391: matches the "cliproxy" alias itself, the static node-type id
+// ("openai-compatible-cliproxy"), and any UUID-suffixed connection id derived from it
+// ("openai-compatible-cliproxy-<uuid>", per src/lib/db/providerNodeSelect.ts's
+// nodeTypeFromId stripping convention) — the runtime `provider` string at this call site
+// was not confirmed to be the bare alias vs. a concrete node/connection id, so match all
+// three shapes rather than guessing one and silently missing the other two.
+const CLIPROXY_PROVIDER_RE = /^(cliproxy|openai-compatible-cliproxy)(-[0-9a-f-]{36})?$/i;
+
+function isProviderWithoutReliableServerTools(provider: string | null | undefined): boolean {
+  if (!provider) return false;
+  if (CLAUDE_FORMAT_PROVIDERS_WITHOUT_SERVER_TOOLS.has(provider)) return true;
+  return CLIPROXY_PROVIDER_RE.test(provider);
+}
 
 export function supportsNativeWebSearchFallbackBypass({
   provider,
@@ -173,7 +201,7 @@ export function supportsNativeWebSearchFallbackBypass({
   // Codex/Gemini bypasses so every native-web-search provider is treated symmetrically.
   if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.CLAUDE) {
     // …except Anthropic-compatible providers that don't actually implement server tools.
-    if (provider && CLAUDE_FORMAT_PROVIDERS_WITHOUT_SERVER_TOOLS.has(provider)) return false;
+    if (isProviderWithoutReliableServerTools(provider)) return false;
     return true;
   }
   return false;
