@@ -399,18 +399,53 @@ decomposition into a growth allowance for whoever edits the file next.
 
 `nightly-release-green.yml` → job **`bank-ratchet-shrinks`** closes that loop:
 
-|          |                                                                                                        |
-| -------- | ------------------------------------------------------------------------------------------------------ |
-| Runs on  | `schedule` (3×/day) + `workflow_dispatch` — deliberately **not** `push`                                |
-| Measures | the highest `release/vX.Y.Z`, same resolution + injection guard as `release-green`                     |
-| Writes   | `check:file-size --update` and `check:complexity-ratchets --update` (both shrink-only by construction) |
-| Verifies | `npm run check:ratchet-bank` (`scripts/quality/verify-ratchet-bank.mjs`)                               |
-| Ships    | one always-current PR against the release branch — force-updated, never spammed                        |
+|          |                                                                                                            |
+| -------- | ---------------------------------------------------------------------------------------------------------- |
+| Runs on  | Opted-in `schedule` (3×/day) + `workflow_dispatch` on the default branch — never `push`                    |
+| Measures | An immutable commit on the highest `release/vX.Y.Z` (or a canonical explicit release branch)               |
+| Writes   | Read-only-token measurement runs the shrink-only `check:file-size` and `check:complexity-ratchets` updates |
+| Verifies | A fresh publisher independently checks the source and allowlisted JSON with `ratchet-bank-publication.mjs` |
+| Ships    | One draft PR against the release branch, updated with an explicit expected-head lease                      |
 
 Banking is batched rather than per-push because it has no latency requirement (a shrink
 banked within 8h is fine) while a per-merge run would rebuild the PR branch repeatedly
 during merge campaigns and pay for a full ESLint walk each time. Detection stays on
 push (`release-green`); only banking is batched.
+
+### Publication isolation and activation
+
+The fork's workflow remains disabled (`disabled_fork`); this plumbing does not enable it.
+Both banking jobs also require the explicit repository variable `vars.RATCHET_BANKING_ENABLED`
+to equal `true`. The velocity-phase pause still returns a no-op. Missing proposed App
+bindings fail closed only after independently verified changes exist:
+`vars.PR_AUTOMATION_APP_CLIENT_ID` and `secrets.PR_AUTOMATION_APP_PRIVATE_KEY`.
+No key provisioning or runtime banking validation is implied by this preparation.
+App-authored PR creation, authenticated updates and automatically triggered required
+checks remain **deferred until deliberate activation**, with the normal spend and
+production gates. Offline fixtures are not end-to-end evidence.
+
+Measurement installs dependencies using only a read-only token, without persisted checkout
+credentials. It exports one size-bounded JSON file, not scripts, patches or an executable
+archive. The publisher runs on a fresh hosted Node 24 runner, checks out the immutable
+workflow SHA, installs no dependencies and uses no measurement cache. Before minting, it
+checks the exact source SHA against the current canonical release branch, trusted ancestry,
+the payload schema and the three allowlisted baseline paths. It independently repeats the
+shrink-only verification and refuses publication if the release branch moved.
+
+The pinned token action requests only current-repository contents and pull-request write
+permissions, with default revocation. The private key is passed only to that action; the
+installation token is used for every push and PR create/update. Git authentication is
+command-scoped (no token URL or persistent git credential). An existing PR must match the
+base, banking head, repository and observed head SHA. The push leases that exact SHA
+(or explicitly expects an absent branch); a lease failure aborts without a PR mutation.
+Already-current data emits no push. Regression fixtures are in
+`tests/unit/ratchet-bank-publication.test.ts`.
+
+Banking pushes are confined to `chore/bank-ratchet-*`, so they cannot recursively invoke
+this schedule/dispatch-only publisher or emit a release/tag. PR checks can run normally
+using native App event semantics. No manual dispatch workaround or existing required check
+is removed. A later merge to a release branch can still enter the existing Docker and VPS
+deployment chain; its normal production approval is separate from banking preparation.
 
 ### The safety verifier
 

@@ -367,48 +367,45 @@ jobs:
   # requirement (a shrink banked within 8h is fine) and a per-merge run would rebuild
   # the PR branch repeatedly during merge campaigns while paying for a full ESLint
   # walk each time. Detection stays on push (release-green above); banking is batched.
+  # Explicit opt-in is additional to GitHub's disabled_fork workflow state. Neither
+  # enabling the workflow nor provisioning App bindings is part of this preparation.
   bank-ratchet-shrinks:
-    name: Bank ratchet shrinks
-    if: ${{ github.event_name != 'push' }}
+    name: Measure ratchet shrinks (read-only)
+    if: ${{ vars.RATCHET_BANKING_ENABLED == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+    outputs:
+      target: ${{ steps.branch.outputs.target }}
+      source_sha: ${{ steps.branch.outputs.source_sha }}
+      changed: ${{ steps.prepare.outputs.changed }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Resolve active release branch
+      - name: Resolve immutable release source
         id: branch
         env:
           INPUT_BRANCH: ${{ github.event.inputs.branch }}
         run: |
           set -euo pipefail
-          if [ -n "${INPUT_BRANCH:-}" ]; then
-            TARGET="$INPUT_BRANCH"
-          else
+          TARGET="${INPUT_BRANCH:-}"
+          if [ -z "$TARGET" ]; then
             TARGET=$(git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/release/v*' \
-              | sed 's#origin/##' \
-              | sort -t/ -k2 -V \
-              | tail -1)
+              | sed 's#origin/##' | sort -t/ -k2 -V | tail -1)
           fi
-          if [ -z "$TARGET" ]; then echo "No release/v* branch found"; exit 1; fi
-          # Same strict guard as the validation job — blocks ref/command injection
-          # through the workflow_dispatch input.
           if ! printf '%s' "$TARGET" | grep -qE '^release/v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Refusing non-canonical branch name: $TARGET"; exit 1
+            echo "Refusing non-canonical release branch" >&2; exit 1
           fi
+          SOURCE_SHA=$(git rev-parse "refs/remotes/origin/$TARGET^{commit}")
+          git merge-base --is-ancestor "$GITHUB_SHA" "$SOURCE_SHA"
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "bank_branch=chore/bank-ratchet-${TARGET#release/}" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout the release branch
-        env:
-          TARGET: ${{ steps.branch.outputs.target }}
-        run: |
-          set -euo pipefail
-          git checkout "$TARGET"
-          git log -1 --oneline
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          git checkout --detach "$SOURCE_SHA"
 
       - uses: actions/setup-node@v7
         with:
@@ -417,80 +414,93 @@ jobs:
 
       - uses: ./.github/actions/npm-ci-retry
 
-      - name: Ratchet the baselines down
+      - name: Measure and export allowlisted data
+        id: prepare
+        env:
+          TARGET: ${{ steps.branch.outputs.target }}
+          SOURCE_SHA: ${{ steps.branch.outputs.source_sha }}
         run: |
-          # Both --update paths are shrink-only by construction (file-size writes only
-          # on `improvements`, complexity-ratchets only when `.improved`), and both exit
-          # non-zero while the branch is over baseline — which is exactly when there is
-          # nothing to bank. Their exit code is not the signal; the verifier below is.
-          # Velocity phase (quality-baseline.json `_policy`, relax-baselines.mjs): the caps
-          # were raised on purpose, so banking the measured shrink would silently undo the
-          # 20% headroom every night. Pause the downward ratchet until the phase closes.
+          set -euo pipefail
           if node -e 'process.exit(require("./config/quality/quality-baseline.json")._policy?.phase === "velocity" ? 0 : 1)'; then
-            echo "Velocity phase active — ratchet banking paused (see docs/architecture/QUALITY_GATES.md → Velocity phase)."
+            echo "Velocity phase active — ratchet banking paused."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          set +e
-          node scripts/check/check-file-size.mjs --update
-          node scripts/check/check-complexity-ratchets.mjs --update
-          exit 0
+          # The measurement scripts may report over-baseline gates. Publication is
+          # decided by an independent shrink-only verifier, not their exit codes.
+          node scripts/check/check-file-size.mjs --update || true
+          node scripts/check/check-complexity-ratchets.mjs --update || true
+          node scripts/quality/ratchet-bank-publication.mjs prepare "$RUNNER_TEMP/bank-data.json"
 
-      - name: Verify the write only went downward
-        id: verify
-        run: |
-          set -euo pipefail
-          # Exits 1 if ANYTHING was raised/added or a rebaseline note was touched.
-          # `set -e` then aborts the job before a commit exists — no PR is opened.
-          node scripts/quality/verify-ratchet-bank.mjs > bank-summary.md
-          if [ -n "$(git status --porcelain config/quality/)" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Nothing to bank — baselines already match the code."
-          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.prepare.outputs.changed == 'true'
+        with:
+          name: ratchet-bank-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bank-data.json
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Open / update the banking PR
-        if: steps.verify.outputs.changed == 'true'
+  publish-ratchet-shrinks:
+    name: Publish verified ratchet shrinks
+    needs: bank-ratchet-shrinks
+    if: ${{ vars.RATCHET_BANKING_ENABLED == 'true' && needs.bank-ratchet-shrinks.outputs.changed == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      TARGET: ${{ needs.bank-ratchet-shrinks.outputs.target }}
+      SOURCE_SHA: ${{ needs.bank-ratchet-shrinks.outputs.source_sha }}
+    steps:
+      # Fresh hosted runner; no npm, local composite action, cache or measurement code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ratchet-bank-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bank-input
+
+      - name: Independently validate data and source before minting
+        id: validate
+        run: node scripts/quality/ratchet-bank-publication.mjs validate "$RUNNER_TEMP/bank-input/bank-data.json"
+
+      - name: Check proposed App bindings (no key exposure)
+        if: steps.validate.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET: ${{ steps.branch.outputs.target }}
-          BANK_BRANCH: ${{ steps.branch.outputs.bank_branch }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          APP_CLIENT_ID: ${{ vars.PR_AUTOMATION_APP_CLIENT_ID }}
+          HAS_APP_KEY: ${{ secrets.PR_AUTOMATION_APP_PRIVATE_KEY != '' }}
         run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "$BANK_BRANCH"
-          git add config/quality/
-          git commit -m "chore(quality): bank ratchet shrinks measured on ${TARGET}"
-          git push --force origin "$BANK_BRANCH"
+          node --input-type=module -e '
+            import { checkBindings } from "./scripts/quality/ratchet-bank-publication.mjs";
+            checkBindings({ enabled: "true", clientId: process.env.APP_CLIENT_ID, hasPrivateKey: process.env.HAS_APP_KEY });
+          '
 
-          {
-            echo "Automated banking of quality-ratchet **shrinks** already present in"
-            echo "\`${TARGET}\` — the downward half of the ratchet, which nothing else runs (#8584)."
-            echo ""
-            echo "Produced by \`check:file-size --update\` + \`check:complexity-ratchets --update\`,"
-            echo "then verified by \`scripts/quality/verify-ratchet-bank.mjs\`: **nothing was raised,"
-            echo "nothing was added, no rebaseline note was touched** — the job aborts without"
-            echo "opening a PR if any of those is violated."
-            echo ""
-            echo "No product code changes. Merging retires growth allowances that the code no"
-            echo "longer needs; not merging leaves them available to whoever edits those files next."
-            echo ""
-            cat bank-summary.md
-            echo ""
-            echo "**Run:** ${RUN_URL}"
-          } > pr-body.md
+      - name: Mint current-repository publication token
+        if: steps.validate.outputs.changed == 'true'
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.PR_AUTOMATION_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PR_AUTOMATION_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
 
-          EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BANK_BRANCH" \
-            --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
-          if [ -n "$EXISTING" ]; then
-            gh pr edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file pr-body.md
-            echo "Updated existing PR #$EXISTING"
-          else
-            gh pr create --repo "$GITHUB_REPOSITORY" --base "$TARGET" --head "$BANK_BRANCH" \
-              --title "chore(quality): bank ratchet shrinks (${TARGET})" --body-file pr-body.md
-          fi
+      - name: Publish with an explicit expected-head lease
+        if: steps.validate.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BANKING_ENABLED: ${{ vars.RATCHET_BANKING_ENABLED }}
+          APP_CLIENT_ID: ${{ vars.PR_AUTOMATION_APP_CLIENT_ID }}
+          HAS_APP_KEY: ${{ secrets.PR_AUTOMATION_APP_PRIVATE_KEY != '' }}
+        run: node scripts/quality/ratchet-bank-publication.mjs publish "$RUNNER_TEMP/bank-input/bank-data.json"
 
   # ── Baseline headroom (velocity phase, 2026-08-30 → v4.0) ──────────────────────
   # The ratchets only speak when a baseline is crossed. With every baseline loosened by
